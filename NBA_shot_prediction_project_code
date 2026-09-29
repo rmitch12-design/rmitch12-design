@@ -1,0 +1,461 @@
+---
+title: "OKC Shot Regression"
+author: "Robbie Mitchell"
+date: "2026-09-21"
+output: html_document
+---
+```{r}
+# NAME: Robbie Mitchell | NUMBER: 9599
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readr)
+library(dplyr)
+library(stringr)
+library(purrr)
+library(xgboost)
+train_df <- read_csv("training.csv.gz", show_col_types = FALSE)
+```
+
+
+```{r}
+# Turn closestdefapproach into 4 numeric columns
+# Format: "{dist_at_1.0s, dist_at_0.75s, dist_at_0.5s, dist_at_0.25s}"
+
+new_approach <- train_df$closestdefapproach %>%
+  str_remove_all("[{}]") %>%
+  str_split_fixed(",", 4) %>%
+  apply(2, as.numeric)
+colnames(new_approach) <- c("def_dist_1_0s", "def_dist_0_75s",
+                                "def_dist_0_5s", "def_dist_0_25s")
+
+train_df <- bind_cols(train_df, as_tibble(new_approach)) %>%
+  mutate(closeout_speed = (def_dist_1_0s - closestdefdist) / 1.0)
+
+# Variable list
+
+continuous_vars <- c(
+  "distance", "locationx", "locationy", "dribblesbefore",
+  "shotclock", "closestdefdist", "shooterspeed",
+  "def_dist_1_0s", "def_dist_0_75s", "def_dist_0_5s", "def_dist_0_25s",
+  "closeout_speed", "num_contesters", "distcont1"
+)
+
+categorical_vars <- c(
+  "season_id", "month", "gamestate", "shottype", "three", "contested"
+)
+
+all_vars <- c(continuous_vars, categorical_vars)
+is_categorical <- all_vars %in% categorical_vars
+
+null_deviance_for <- function(y) {
+  glm(y ~ 1, family = binomial())$deviance
+}
+
+# Pseudo-R2 loop
+pseudo_r2_table <- map2_dfr(all_vars, is_categorical, function(v, cat) {
+  d <- train_df %>% filter(!is.na(.data[[v]]))
+
+  form <- if (cat) {
+    as.formula(paste0("outcome ~ factor(", v, ")"))
+  } else {
+    as.formula(paste0("outcome ~ ", v))
+  }
+
+  fit <- glm(form, data = d, family = binomial())
+  nd  <- null_deviance_for(d$outcome)
+
+  tibble(
+    variable    = v,
+    type        = if (cat) "categorical" else "continuous",
+    n_obs       = nrow(d),
+    n_levels    = if (cat) n_distinct(d[[v]]) else NA_integer_,
+    deviance    = fit$deviance,
+    null_dev    = nd,
+    pseudo_r2   = 1 - (fit$deviance / nd),
+    aic         = fit$aic
+  )
+}) %>%
+  arrange(desc(pseudo_r2))
+
+print(pseudo_r2_table, n = Inf)
+
+write_csv(pseudo_r2_table, "pseudo_r2_all_vars.csv")
+```
+
+```{r}
+# Smoothing shooter_id for players with a low number of shot attempts
+set.seed(42)
+K <- 5
+train_df <- train_df %>% mutate(fold = sample(rep(1:K, length.out = n())))
+
+global_mean <- mean(train_df$outcome)
+
+# Smoothing constant: how many "prior" pseudo-shots at the global
+# mean we blend in. Higher = more shrinkage toward league average,
+# safer for low-volume levels.
+
+smoothing_k <- 20
+
+# Generic out-of-fold shrinkage encoder
+oof_target_encode <- function(df, id_col, smoothing_k) {
+  encoded <- rep(NA_real_, nrow(df))
+  for (k in 1:K) {
+    train_idx <- df$fold != k
+    test_idx  <- df$fold == k
+
+    stats <- df[train_idx, ] %>%
+      group_by(.data[[id_col]]) %>%
+      summarise(n = n(), rate = mean(outcome), .groups = "drop") %>%
+      mutate(shrunk_rate = (n * rate + smoothing_k * global_mean) / (n + smoothing_k))
+
+    lookup <- setNames(stats$shrunk_rate, stats[[id_col]])
+
+    ids_test <- df[[id_col]][test_idx]
+    vals <- lookup[ids_test]
+    # ids that never appeared in this folds's training data set to global mean
+    vals[is.na(vals)] <- global_mean
+    encoded[test_idx] <- vals
+  }
+  encoded
+}
+
+id_cols <- c("shooter_id", "closestdef_id", "off_team_id", "def_team_id")
+
+for (col in id_cols) {
+  new_col <- paste0(col, "_enc")
+  train_df[[new_col]] <- oof_target_encode(train_df, col, smoothing_k)
+}
+
+# Pseudo-R2 for the encoded (out-of-fold) versions
+null_dev <- glm(outcome ~ 1, data = train_df, family = binomial())$deviance
+
+encoded_screen <- map_dfr(id_cols, function(col) {
+  enc_col <- paste0(col, "_enc")
+  fit <- glm(as.formula(paste("outcome ~", enc_col)),
+             data = train_df, family = binomial())
+  tibble(
+    variable  = enc_col,
+    n_levels_original = n_distinct(train_df[[col]]),
+    pseudo_r2 = 1 - (fit$deviance / null_dev)
+  )
+}) %>% arrange(desc(pseudo_r2))
+
+print(encoded_screen, n = Inf)
+
+saveRDS(train_df, "train_encoded.rds")
+```
+
+```{r}
+# Base model, no interactions 
+base_formula <- outcome ~ shottype + distance + closestdefdist + shotclock +
+  shooterspeed + num_contesters + dribblesbefore + shooter_id_enc
+
+model_base <- glm(base_formula, data = train_df, family = binomial())
+
+cat(" Base model summary \n")
+print(summary(model_base))
+
+cat("\nAIC:", AIC(model_base), "  BIC:", BIC(model_base), "\n")
+
+# CV log-loss 
+
+log_loss <- function(y, p) {
+  p <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+
+cv_log_loss <- function(formula, data, folds, K) {
+  losses <- numeric(K)
+  for (k in 1:K) {
+    train_fold <- data[folds != k, ]
+    test_fold  <- data[folds == k, ]
+    fit <- glm(formula, data = train_fold, family = binomial())
+    p <- predict(fit, newdata = test_fold, type = "response")
+    losses[k] <- log_loss(test_fold$outcome, p)
+  }
+  losses
+}
+
+cv_losses_base <- cv_log_loss(base_formula, train_df, train_df$fold, K)
+cat("\nPer-fold CV log-loss:", round(cv_losses_base, 5), "\n")
+cat("Mean CV log-loss:", mean(cv_losses_base), " (sd:", sd(cv_losses_base), ")\n")
+
+# In-sample log-loss 
+p_insample <- predict(model_base, type = "response")
+cat("In-sample log-loss:", log_loss(train_df$outcome, p_insample), "\n")
+```
+
+```{r}
+# testing interaction terms
+base_formula <- outcome ~ shottype + distance + closestdefdist + shotclock +
+  shooterspeed + num_contesters + dribblesbefore + shooter_id_enc
+ 
+candidate_terms <- c(
+  "shottype:distance",
+  "shottype:closestdefdist",
+  "num_contesters:distance",
+  "shottype:shooterspeed",
+  "gamestate:shotclock",
+  "three:closestdefdist",
+  "shottype:shotclock",
+  "dribblesbefore:shotclock"
+)
+ 
+# since gamestate/three aren't in the base formula
+needs_gamestate <- c("gamestate:shotclock")
+needs_three     <- c("three:closestdefdist")
+ 
+model_base <- glm(base_formula, data = train_df, family = binomial())
+aic_base <- AIC(model_base)
+bic_base <- BIC(model_base)
+ 
+log_loss <- function(y, p) {
+  p <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+ 
+cv_log_loss <- function(formula, data, folds, K) {
+  losses <- numeric(K)
+  for (k in 1:K) {
+    train_fold <- data[folds != k, ]
+    test_fold  <- data[folds == k, ]
+    fit <- glm(formula, data = train_fold, family = binomial())
+    p <- predict(fit, newdata = test_fold, type = "response")
+    losses[k] <- log_loss(test_fold$outcome, p)
+  }
+  mean(losses)
+}
+ 
+cv_ll_base <- cv_log_loss(base_formula, train_df, train_df$fold, K)
+ 
+results <- map_dfr(candidate_terms, function(term) {
+  extra_main <- character(0)
+  if (term %in% needs_gamestate) extra_main <- c(extra_main, "gamestate")
+  if (term %in% needs_three)     extra_main <- c(extra_main, "three")
+ 
+  rhs <- paste(c(
+    "shottype", "distance", "closestdefdist", "shotclock",
+    "shooterspeed", "num_contesters", "dribblesbefore", "shooter_id_enc",
+    extra_main, term
+  ), collapse = " + ")
+  form <- as.formula(paste("outcome ~", rhs))
+ 
+  fit_full <- glm(form, data = train_df, family = binomial())
+  extra_params <- length(coef(fit_full)) - length(coef(model_base))
+  cv_ll_term <- cv_log_loss(form, train_df, train_df$fold, K)
+ 
+  tibble(
+    term              = term,
+    extra_params      = extra_params,
+    aic_delta         = aic_base - AIC(fit_full),   
+    bic_delta         = bic_base - BIC(fit_full),  
+    cv_logloss_delta  = cv_ll_base - cv_ll_term
+  )
+}) %>%
+  arrange(desc(cv_logloss_delta))
+ 
+print(results, n = Inf)
+write_csv(results, "interaction_term_comparison.csv")
+```
+
+```{r}
+# Final logistic model formula
+final_formula <- outcome ~ shottype + distance + closestdefdist + shotclock +
+  shooterspeed + num_contesters + dribblesbefore + shooter_id_enc +
+  shottype:distance + shottype:closestdefdist + num_contesters:distance
+ 
+model_final <- glm(final_formula, data = train_df, family = binomial())
+ 
+cat(" Final model summary \n")
+print(summary(model_final))
+ 
+cat("\nAIC:", AIC(model_final), "\n")
+cat("BIC:", BIC(model_final), "\n")
+
+# In sample log loss
+log_loss <- function(y, p) {
+  p <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+ 
+p_insample <- predict(model_final, type = "response")
+insample_ll <- log_loss(train_df$outcome, p_insample)
+cat("\nIn-sample log-loss:", insample_ll, "\n")
+
+# CV log loss
+cv_log_loss <- function(formula, data, folds, K) {
+  losses <- numeric(K)
+  for (k in 1:K) {
+    fit <- glm(formula, data = data[folds != k, ], family = binomial())
+    p <- predict(fit, newdata = data[folds == k, ], type = "response")
+    losses[k] <- log_loss(data$outcome[folds == k], p)
+  }
+  losses
+}
+ 
+cv_losses <- cv_log_loss(final_formula, train_df, train_df$fold, K)
+cat("Mean CV log-loss:", mean(cv_losses), " (sd:", sd(cv_losses), ")\n")
+cat("In-sample vs. CV gap:", insample_ll - mean(cv_losses))
+```
+
+```{r}
+# Gradient Boosted Tree Model 
+
+train_df$shottype_code <- as.integer(factor(train_df$shottype)) - 1  
+
+feat_cols <- c("distance", "closestdefdist", "shotclock", "shooterspeed",
+               "num_contesters", "dribblesbefore", "shooter_id_enc",
+               "shottype_code")
+ 
+X <- as.matrix(train_df[, feat_cols])
+y <- train_df$outcome
+ 
+log_loss <- function(y, p) {
+  p <- pmin(pmax(p, 1e-12), 1 - 1e-12)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+ 
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "logloss",
+  max_depth = 6,
+  eta = 0.05,               
+  subsample = 0.8,
+  colsample_bytree = 0.8
+)
+ 
+cv_losses <- numeric(K)
+models <- vector("list", K)
+ 
+for (k in 1:K) {
+  train_idx <- train_df$fold != k
+  test_idx  <- train_df$fold == k
+ 
+  dtrain <- xgb.DMatrix(data = X[train_idx, ], label = y[train_idx])
+  dtest  <- xgb.DMatrix(data = X[test_idx, ], label = y[test_idx])
+ 
+  fit <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 500,
+    watchlist = list(val = dtest),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+ 
+  p <- predict(fit, dtest)
+  cv_losses[k] <- log_loss(y[test_idx], p)
+  models[[k]] <- fit
+ 
+  cat("Fold", k, "-- best iteration:", fit$best_iteration,
+      " log-loss:", round(cv_losses[k], 5), "\n")
+}
+ 
+cat("\n XGBoost CV results \n")
+cat("Per-fold log-loss:", round(cv_losses, 5), "\n")
+cat("Mean CV log-loss:", mean(cv_losses), " (sd:", sd(cv_losses), ")\n")
+ 
+importance <- xgb.importance(feature_names = feat_cols, model = models[[1]])
+cat("\n Feature importance \n")
+print(importance)
+ 
+```
+
+```{r}
+# Production shooter_id encoding 
+shooter_stats_full <- train_df %>%
+  group_by(shooter_id) %>%
+  summarise(n = n(), rate = mean(outcome), .groups = "drop") %>%
+  mutate(shrunk_rate = (n * rate + smoothing_k * global_mean) / (n + smoothing_k))
+shooter_lookup_full <- setNames(shooter_stats_full$shrunk_rate, shooter_stats_full$shooter_id)
+
+train_df$shooter_id_enc_prod <- shooter_lookup_full[train_df$shooter_id]
+stopifnot(!any(is.na(train_df$shooter_id_enc_prod)))
+
+
+shottype_levels <- levels(factor(train_df$shottype))
+
+feat_cols_prod <- c("distance", "closestdefdist", "shotclock", "shooterspeed",
+                     "num_contesters", "dribblesbefore", "shooter_id_enc_prod",
+                     "shottype_code")
+
+# Picking nrounds via a held-out validation slice (10%)
+
+set.seed(42)
+val_idx <- sample(seq_len(nrow(train_df)), size = floor(0.1 * nrow(train_df)))
+
+dsub <- xgb.DMatrix(data = as.matrix(train_df[-val_idx, feat_cols_prod]),
+                     label = train_df$outcome[-val_idx])
+dval <- xgb.DMatrix(data = as.matrix(train_df[val_idx, feat_cols_prod]),
+                     label = train_df$outcome[val_idx])
+
+fit_for_nrounds <- xgb.train(
+  params = params,   
+  data = dsub,
+  nrounds = 1000,
+  watchlist = list(val = dval),
+  early_stopping_rounds = 20,
+  verbose = 0
+)
+
+best_nrounds <- fit_for_nrounds$best_iteration
+if (is.null(best_nrounds) || length(best_nrounds) == 0) {
+  best_nrounds <- xgb.attr(fit_for_nrounds, "best_iteration")
+}
+if (is.null(best_nrounds) || length(best_nrounds) == 0) {
+  best_nrounds <- fit_for_nrounds$niter  # total rounds actually run, last resort
+}
+best_nrounds <- as.integer(best_nrounds)
+
+stopifnot(!is.null(best_nrounds), length(best_nrounds) == 1, !is.na(best_nrounds), best_nrounds > 0)
+
+cat("Best nrounds:", best_nrounds, "\n")
+
+# refit on ALL training data using best_nrounds
+dfull <- xgb.DMatrix(data = as.matrix(train_df[, feat_cols_prod]),
+                      label = train_df$outcome)
+
+model_prod <- xgb.train(
+  params = params,
+  data = dfull,
+  nrounds = best_nrounds,
+  verbose = 0
+)
+
+
+test_df <- read_csv("testing.csv.gz", show_col_types = FALSE)
+
+test_df$shooter_id_enc_prod <- shooter_lookup_full[test_df$shooter_id]
+n_unseen <- sum(is.na(test_df$shooter_id_enc_prod))
+cat("Test rows with a shooter_id unseen in training:", n_unseen,
+    sprintf("(%.2f%%) -- filled with global mean make rate (%.4f)\n",
+            100 * n_unseen / nrow(test_df), global_mean))
+test_df$shooter_id_enc_prod[is.na(test_df$shooter_id_enc_prod)] <- global_mean
+stopifnot(!any(is.na(test_df$shooter_id_enc_prod)))
+
+test_df$shottype_code <- match(test_df$shottype, shottype_levels) - 1
+stopifnot(!any(is.na(test_df$shottype_code)))
+
+dtest <- xgb.DMatrix(data = as.matrix(test_df[, feat_cols_prod]))
+test_df$make_prob <- predict(model_prod, dtest)
+
+submission <- test_df %>% select(shot_id, make_prob)
+stopifnot(nrow(submission) == nrow(test_df))
+stopifnot(!any(is.na(submission$make_prob)))
+
+cat("\nPredicted make_prob summary:\n")
+print(summary(submission$make_prob))
+
+downloads_path <- file.path(Sys.getenv("USERPROFILE"), "Downloads", "submission.csv")
+write_csv(submission, downloads_path)
+cat("\nsubmission.csv written to:", downloads_path, "\n")
+cat("Rows written:", nrow(submission), "\n")
+```
+
+
