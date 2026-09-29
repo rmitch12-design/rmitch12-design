@@ -1,4 +1,9 @@
-## Hi there 👋
+## NBA Basketball Shot Prediction Analysis (R Programming)                                                                  
+# Personal Project								                                       
+# Developed a linear regression and gradient boosted tree model to predict the likelihood of an NBA shot going in.
+# Filtered and manipulated real NBA data in R to accurately generate and fit multivariate models.
+# Evaluated both models based on log-loss to assess predictive power.
+
 
 <!--
 **rmitch12-design/rmitch12-design** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
